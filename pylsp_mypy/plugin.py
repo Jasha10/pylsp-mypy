@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import warnings
 from pathlib import Path
-from typing import IO, Any, Dict, List, Optional
+from typing import IO, Any, Dict, List, Optional, Tuple, Union
 
 import toml
 from mypy import api as mypy_api
@@ -29,6 +29,13 @@ from pylsp.workspace import Document, Workspace
 line_pattern: str = r"((?:^[a-z]:)?[^:]+):(?:(\d+):)?(?:(\d+):)? (\w+): (.*)"
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
+# create file handler which logs even debug messages
+fh = logging.FileHandler(Path.home() / "pylsp_LOG.txt")
+# fh.setLevel(logging.DEBUG)
+formatter = logging.Formatter("%(asctime)s - %(name)s:%(lineno)d - %(levelname)s - %(message)s")
+fh.setFormatter(formatter)
+log.addHandler(fh)
 
 # A mapping from workspace path to config file path
 mypyConfigFileMap: Dict[str, Optional[str]] = {}
@@ -217,64 +224,36 @@ def pylsp_lint(
                 ["mypy", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             report = completed_process.stdout.decode()
-            errors = completed_process.stderr.decode()
         else:
             # mypy does not exist on path, but must exist in the env pylsp-mypy is installed in
             # -> use mypy via api
             log.info("executing mypy args = %s via api", args)
-            report, errors, _ = mypy_api.run(args)
+            report, _, _ = mypy_api.run(args)
     else:
-        # If dmypy daemon is non-responsive calls to run will block.
-        # Check daemon status, if non-zero daemon is dead or hung.
-        # If daemon is hung, kill will reset
-        # If daemon is dead/absent, kill will no-op.
-        # In either case, reset to fresh state
+        dmypy_status_file = settings.get("dmypy_status_file", None)
+        dmypy_timeout: Union[int, List[str]] = settings.get("dmypy_timeout", [])
+        if isinstance(dmypy_timeout, int):
+            dmypy_timeout = ["--timeout", str(dmypy_timeout)]
+        assert isinstance(dmypy_timeout, list)
 
-        if shutil.which("dmypy"):
-            # dmypy exists on path
-            # -> use mypy on path
-            completed_process = subprocess.run(
-                ["dmypy", *apply_overrides(args, overrides)], stderr=subprocess.PIPE
-            )
-            _err = completed_process.stderr.decode()
-            _status = completed_process.returncode
-            if _status != 0:
-                log.info(
-                    "restarting dmypy from status: %s message: %s via path", _status, _err.strip()
-                )
-                subprocess.run(["dmypy", "kill"])
-        else:
-            # dmypy does not exist on path, but must exist in the env pylsp-mypy is installed in
-            # -> use dmypy via api
-            _, _err, _status = mypy_api.run_dmypy(["status"])
-            if _status != 0:
-                log.info(
-                    "restarting dmypy from status: %s message: %s via api", _status, _err.strip()
-                )
-                mypy_api.run_dmypy(["kill"])
+        _, stderr, retcode = run_dmypy(["status"], dmypy_status_file)
+        if retcode != 0:
+            # If dmypy daemon is non-responsive calls to run will block.
+            # Check daemon status, if non-zero daemon is dead or hung.
+            # If daemon is hung, kill will reset
+            # If daemon is dead/absent, kill will no-op.
+            # In either case, reset to fresh state
+            log.info("killing dmypy as status returned %s, error='%s'", retcode, stderr.strip())
+            run_dmypy(["kill"], dmypy_status_file)
+            log.info("starting dmypy")
+            run_dmypy(["start", *dmypy_timeout], dmypy_status_file)
 
-        # run to use existing daemon or restart if required
-        args = ["run", "--"] + apply_overrides(args, overrides)
-
-        if shutil.which("dmypy"):
-            # dmypy exists on path
-            # -> use mypy on path
-            log.info("dmypy run args = %s via path", args)
-            completed_process = subprocess.run(
-                ["dmypy", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            report = completed_process.stdout.decode()
-            errors = completed_process.stderr.decode()
-        else:
-            # dmypy does not exist on path, but must exist in the env pylsp-mypy is installed in
-            # -> use dmypy via api
-            log.info("dmypy run args = %s via api", args)
-            report, errors, _ = mypy_api.run_dmypy(args)
-
-    log.debug("report:\n%s", report)
-    log.debug("errors:\n%s", errors)
+        args = apply_overrides(args, overrides)
+        args = ["run", *dmypy_timeout, "--", *args]
+        report, stderr, _ = run_dmypy(args, dmypy_status_file)
 
     diagnostics = []
+    log.debug("PARSING REPORT")
     for line in report.splitlines():
         log.debug("parsing: line = %r", line)
         diag = parse_line(line, document)
@@ -285,6 +264,29 @@ def pylsp_lint(
 
     last_diagnostics[document.path] = diagnostics
     return diagnostics
+
+
+def run_dmypy(args: List[str], dmypy_status_file: Optional[str]) -> Tuple[str, str, int]:
+    """Return stdout, stderr, retcode"""
+    if dmypy_status_file:
+        args = ["--status-file", os.path.expanduser(dmypy_status_file), *args]
+    if shutil.which("dmypy"):
+        # dmypy exists on path
+        # -> use mypy on path
+        log.debug("dmypy via path, args:\n%s", args)
+        completed_process = subprocess.run(["dmypy", *args], capture_output=True)
+        stdout = completed_process.stdout.decode()
+        stderr = completed_process.stderr.decode()
+        retcode = completed_process.returncode
+    else:
+        # dmypy does not exist on path, but must exist in the env pylsp-mypy is installed in
+        # -> use dmypy via api
+        log.debug("dmypy via api, args:\n%s", args)
+        stdout, stderr, retcode = mypy_api.run_dmypy(args)
+    log.debug("retcode: %s", retcode)
+    log.debug("stdout: %s", stdout.strip())
+    log.debug("stderr: %s", stderr.strip())
+    return stdout, stderr, retcode
 
 
 @hookimpl
